@@ -23,10 +23,26 @@ const validate = new AsyncFunction(
   source,
 );
 
+test("AWS workflows use Reloop branch names and keep automatic deployment main-only", () => {
+  const readWorkflow = (name) => fs.readFileSync(
+    path.resolve(__dirname, `../../.github/workflows/${name}.yml`), "utf8",
+  );
+  const release = readWorkflow("aws-release");
+  const promote = readWorkflow("aws-promote");
+  for (const text of [release, workflow, promote]) {
+    assert.doesNotMatch(text, /fullcloud(?:main|staging)/);
+  }
+  assert.match(release, /branches: \[staging, main\]/);
+  assert.match(release, /if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main' && vars\.AWS_AUTO_DEPLOY != 'false'/);
+  assert.match(workflow, /environment: \$\{\{ github\.ref == 'refs\/heads\/main' && 'aws-production' \|\| 'aws-staging' \}\}/);
+  assert.match(workflow, /os\.environ\['GITHUB_REF_NAME'\] != 'main'/);
+  assert.match(promote, /run\.head_branch !== 'staging'/);
+});
+
 function runRecord(overrides = {}) {
   return {
     path: ".github/workflows/aws-release.yml",
-    head_branch: "fullcloudstaging",
+    head_branch: "staging",
     event: "push",
     status: "in_progress",
     conclusion: null,
@@ -38,7 +54,7 @@ function runRecord(overrides = {}) {
   };
 }
 
-async function check(run, auto = true, branch = "fullcloudstaging") {
+async function check(run, auto = true, branch = "staging") {
   const exported = {};
   await validate(
     { rest: { actions: { getWorkflowRun: async () => ({ data: run }) } } },
@@ -92,34 +108,34 @@ test("automatic deploy rejects another run, attempt, commit, branch, event or re
 test("a deployment accepts only a build from the branch that runs it", async () => {
   assert.deepEqual(
     await check(
-      runRecord({ head_branch: "fullcloudmain" }),
+      runRecord({ head_branch: "main" }),
       true,
-      "fullcloudmain",
+      "main",
     ),
     { RELEASE_COMMIT: "abc123", RELEASE_VERSION: "abc123-123-1" },
   );
   await assert.rejects(
     check(
-      runRecord({ head_branch: "fullcloudstaging" }),
+      runRecord({ head_branch: "staging" }),
       true,
-      "fullcloudmain",
+      "main",
     ),
     /trusted staging build/,
   );
   await assert.rejects(
     check(
-      runRecord({ head_branch: "fullcloudmain" }),
+      runRecord({ head_branch: "main" }),
       true,
-      "fullcloudstaging",
+      "staging",
     ),
     /trusted staging build/,
   );
   const done = { status: "completed", conclusion: "success" };
   await assert.rejects(
     check(
-      runRecord({ ...done, head_branch: "fullcloudstaging" }),
+      runRecord({ ...done, head_branch: "staging" }),
       false,
-      "fullcloudmain",
+      "main",
     ),
     /trusted staging build/,
   );

@@ -55,11 +55,11 @@ concurrency:
 
 jobs:
   staging:
-    if: github.ref == 'refs/heads/fullcloudstaging' || github.ref == 'refs/heads/fullcloudmain'
+    if: github.ref == 'refs/heads/staging' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    # fullcloudmain deploys through aws-production so its required reviewers gate
-    # every live operation; fullcloudstaging stays build-only (see input checks).
-    environment: ${{ github.ref == 'refs/heads/fullcloudmain' && 'aws-production' || 'aws-staging' }}
+    # main deploys through aws-production so its required reviewers gate
+    # every live operation; staging stays build-only (see input checks).
+    environment: ${{ github.ref == 'refs/heads/main' && 'aws-production' || 'aws-staging' }}
     timeout-minutes: 60
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
@@ -89,8 +89,8 @@ jobs:
           if not re.fullmatch(r'[0-9]{12}', os.environ['AWS_ACCOUNT_ID']):
               raise SystemExit('Set AWS_ACCOUNT_ID')
           live = os.environ['DEPLOY'] == 'true'
-          if live and op != 'status' and os.environ['GITHUB_REF_NAME'] != 'fullcloudmain':
-              raise SystemExit('Live operations run only from fullcloudmain; fullcloudstaging is build-only')
+          if live and op != 'status' and os.environ['GITHUB_REF_NAME'] != 'main':
+              raise SystemExit('Live operations run only from main; staging is build-only')
           if live and op != 'status' and os.environ['COMPATIBLE'] != 'true':
               raise SystemExit('Review schema, worker handoff and backups first')
           if op in {'promote', 'rollback'} and not live:
