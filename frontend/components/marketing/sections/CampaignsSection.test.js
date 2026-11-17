@@ -610,6 +610,9 @@ describe("CampaignsSection (Marketing Workspace)", () => {
   it("supports editing legacy brandPreference campaign with op: neq and saves with operator: nin", async () => {
     const legacyCampaign = {
       ...sampleCampaigns[1],
+      // Keep this serialization test independent of the date it runs.
+      startsAt: new Date(Date.now() + 86_400_000).toISOString(),
+      endsAt: new Date(Date.now() + 2 * 86_400_000).toISOString(),
       targetSegment: [
         {
           field: "brandPreference",
