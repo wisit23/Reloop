@@ -39,6 +39,38 @@ test("AWS workflows use Reloop branch names and keep automatic deployment main-o
   assert.match(promote, /run\.head_branch !== 'staging'/);
 });
 
+test("automatic deploy depends on the full CI workflow for the same main push", () => {
+  const release = fs.readFileSync(
+    path.resolve(__dirname, "../../.github/workflows/aws-release.yml"), "utf8",
+  );
+  const ci = fs.readFileSync(
+    path.resolve(__dirname, "../../.github/workflows/ci.yml"), "utf8",
+  );
+  const ciJob = release.match(/^ {2}ci:\r?\n([\s\S]*?)(?=^ {2}\w[\w-]*:)/m)?.[1];
+  assert.ok(ciJob, "the release pipeline must run CI");
+  assert.match(ciJob, /if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/);
+  assert.match(ciJob, /uses: \.\/\.github\/workflows\/ci\.yml/);
+  assert.match(ci, /^ {2}workflow_call:/m);
+  const deployJob = release.match(/^ {2}deploy:\r?\n([\s\S]*)/m)?.[1];
+  assert.match(deployJob, /needs: \[ci, bundle\]/);
+  assert.doesNotMatch(deployJob, /always\(\)|continue-on-error:/);
+  const stages = ci.match(/needs: \[([^\]]+)\]/)?.[1].split(/,\s*/).sort();
+  assert.deepEqual(stages, ["core-tests", "docker-build", "frontend", "quality-gate", "service-tests"]);
+  assert.match(ci, /jq -e 'all\(\.\[\]; \.result == "success"\)'/);
+});
+
+test("Docker smoke check requires the Node major used by the project and images", () => {
+  const root = path.resolve(__dirname, "../..");
+  const major = fs.readFileSync(path.join(root, ".nvmrc"), "utf8").trim();
+  const ci = fs.readFileSync(path.join(root, ".github/workflows/ci.yml"), "utf8");
+  const dockerfile = fs.readFileSync(path.join(root, "deploy/cicd/Dockerfile"), "utf8");
+  const requiredMajor = ci.match(/process\.versions\.node\.split\("\."\)\[0\] !== "(\d+)"/)?.[1];
+  assert.equal(requiredMajor, major);
+  const images = [...dockerfile.matchAll(/^FROM node:(\d+)-alpine/gm)];
+  assert.ok(images.length > 0);
+  for (const image of images) assert.equal(image[1], major);
+});
+
 function runRecord(overrides = {}) {
   return {
     path: ".github/workflows/aws-release.yml",

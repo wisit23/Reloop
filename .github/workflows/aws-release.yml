@@ -21,6 +21,10 @@ env:
   AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
 
 jobs:
+  ci:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
   verify:
     if: github.ref == 'refs/heads/staging' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -149,14 +153,14 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # Deploy each successful main push build: rolling before bootstrap,
+  # Deploy each main push only after its CI and image build succeed: rolling before bootstrap,
   # blue/green after. The called job uses environment aws-production, so its
   # required reviewers approve before anything changes. staging pushes
   # only verify and build. Set repository variable AWS_AUTO_DEPLOY=false to pause
   # deployment without editing code.
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_AUTO_DEPLOY != 'false'
-    needs: bundle
+    needs: [ci, bundle]
     permissions:
       contents: read
       actions: read
