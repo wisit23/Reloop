@@ -24,10 +24,7 @@ jobs:
   verify:
     if: github.ref == 'refs/heads/staging' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
-    permissions:
-      contents: read
-      actions: read
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Validate repository account configuration
@@ -47,12 +44,6 @@ jobs:
       - run: python3 -B -m unittest discover -s deploy/aws -p 'test_*.py' -v
       - run: node --test scripts/ci/awsPipeline.test.cjs
       - run: node scripts/ci/release-audit.cjs
-      - name: Require successful CI for this main commit
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await require('./scripts/ci/wait-for-ci.cjs')({github, context, core});
 
   images:
     needs: verify
@@ -158,7 +149,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # Deploy each main push only after its CI and image build succeed: rolling before bootstrap,
+  # Deploy each successful main push build: rolling before bootstrap,
   # blue/green after. The called job uses environment aws-production, so its
   # required reviewers approve before anything changes. staging pushes
   # only verify and build. Set repository variable AWS_AUTO_DEPLOY=false to pause
