@@ -1,5 +1,12 @@
 # AWS backend staging (Node 22)
 
+**Current choice: [direct EKS Auto Mode staging](EKS.md), with CloudFront HTTPS
+and a private ALB.** Follow that guide for new setup. The Beanstalk instructions
+below are retained for the earlier deployment path; `application.zip` is not an
+EKS deployment package. The build workflow now only builds images and the legacy
+Beanstalk promotion workflow is disabled unless explicitly opted in with
+`AWS_LEGACY_BEANSTALK_ENABLED=true`.
+
 This is an opt-in deployment path for **Elastic Beanstalk Standard, Docker Compose,
 Application Load Balancer and private ECR**. Frontend hosting is separate on Amplify.
 The existing [single-node VM deployment](../production-cloud/README.md) and its
@@ -106,30 +113,66 @@ does **not** create VPCs, instances, databases, HTTPS listeners or scaling polic
 Docker Compose enhanced health needs access logs in AWS's supported format; the
 bundle provides platform log streaming, not an application access-log dashboard.
 
-## GitHub setup (no permanent AWS keys)
+## GitHub setup (access-key authentication)
 
-Create environments `aws-staging` and `aws-promotion`; restrict them to main. Enable
-required reviewers for promotion where the repository plan supports that feature.
-Both workflows are `workflow_dispatch` only and share one deployment concurrency
-group. Neither replaces the existing CI, GHCR or VM deployment workflow.
+The current delivery path is `fullcloudstaging` -> backend staging. Test that API
+with the Amplify staging frontend before promoting application code to
+`fullcloudmain`. Production deployment is not wired yet: it will need separate
+GitHub environment configuration, Beanstalk environments, secrets/data and a
+reviewed production release path. The legacy Beanstalk workflow rejects
+`fullcloudmain`. The EKS workflows (`aws-release.yml`, `aws-eks-staging.yml`)
+deploy `fullcloudmain` through GitHub environment `aws-production`; see
+BLUEGREEN.md.
 
-Create GitHub OIDC trust for your exact repository and the two environment subjects,
-with audience `sts.amazonaws.com`. Verify the subject format emitted for your
-repository's OIDC configuration; scope it according to the official GitHub/AWS
-instructions. The workflow role needs ECR push, bundle `PutObject` on the artifact
-prefix, and Beanstalk describe/create-application-version/update-environment/
-swap-environment-cnames for the intended application and environments. `GetAuthorizationToken`
-and some describe operations require resource `*`; scope other actions by ARN.
-Do not grant AdministratorAccess as an image-push workaround.
+Blue/Green here means two Beanstalk environments **inside staging**. The legacy
+variable names `AWS_EB_PRODUCTION_CNAME` / `AWS_EB_PRODUCTION_URL` mean the stable
+public endpoint of that staging pair, not the actual production API. Do not put
+production resources or production data into `aws-staging`.
 
-Set these **repository variables**. Keep environment-level overrides consistent;
-the workflow-wide Region/account settings are read before individual jobs run:
+Create the GitHub environment `aws-staging` and restrict it to
+`fullcloudstaging`. Both AWS workflows currently target staging only.
+Enable required reviewers where the repository plan supports that feature. Both workflows are `workflow_dispatch` only and share
+one deployment concurrency group. Neither replaces existing CI, GHCR or VM workflows.
+
+GitHub requires a `workflow_dispatch` workflow to exist on the repository's default
+branch before it can be dispatched. If the default branch is still `main` without
+these files, first merge the reviewed workflow definitions there, keeping the
+`fullcloudstaging` execution guards, then select `fullcloudstaging` when running them.
+Do not change the default branch or merge the full application just to expose a button.
+
+Use a dedicated IAM user such as `reloop-github-deploy`. Store its credentials in
+GitHub Settings > Secrets and variables > Actions as repository secrets:
+
+- `AWS_ACCESS_KEY_ID`
+- `AWS_SECRET_ACCESS_KEY`
+
+Never commit credentials or use a root access key. These workflows use the secrets
+directly; they do not require an OIDC provider or `AWS_DEPLOY_ROLE_ARN`. Protect
+workflow changes and restrict repository write access: a modified workflow can
+access repository secrets. Rotate/revoke the key when required. Prefer temporary
+credentials through OIDC when that becomes available for the account.
+
+For the first bootstrap run, grant only ECR push/pull permissions on the six
+`reloop/` repositories plus `ecr:GetAuthorizationToken` on resource `*`.
+Leave `deploy_inactive=false` and `compatible=false`. Only `AWS_REGION`,
+`AWS_ACCOUNT_ID` and the two secrets are required for this build-only run. It
+pushes images and saves the bundle in GitHub artifacts; it does not upload to S3
+or change Beanstalk. The ECR-only policy cannot deploy or promote.
+
+Before enabling deployment, add narrowly scoped bundle `PutObject` permission on
+the artifact prefix and Beanstalk describe/create-application-version/
+update-environment/swap-environment-cnames for the intended application and
+pair of environments. Some describe operations require resource `*`; scope other
+actions by ARN. Do not grant AdministratorAccess as an image-push workaround.
+
+Set `AWS_REGION` and `AWS_ACCOUNT_ID` as **repository variables**; the workflow-wide
+settings are read before jobs run. Put the remaining Beanstalk/bucket variables in
+the **aws-staging environment** and point them only at staging resources:
 
 | Variable                  | Value                                                            |
 | ------------------------- | ---------------------------------------------------------------- |
 | `AWS_REGION`              | `ap-southeast-2`                                                 |
 | `AWS_ACCOUNT_ID`          | 12-digit project account ID                                      |
-| `AWS_DEPLOY_ROLE_ARN`     | OIDC workflow role ARN                                           |
 | `AWS_BUNDLE_BUCKET`       | private application-bundle bucket                                |
 | `AWS_EB_APPLICATION`      | Beanstalk application name, e.g. `reloop`                        |
 | `AWS_EB_BLUE`             | first environment name                                           |
@@ -148,7 +191,7 @@ pass smoke tests. Provision listeners/redirects and confirm DNS before staging.
 
 ## First deployment / bootstrap
 
-1. Land reviewed code on main and run **AWS stage backend** with
+1. Land reviewed code on `fullcloudstaging` and run **AWS stage backend** with
    `deploy_inactive=false`. It runs checks, builds six Node 22 images in ECR and
    uploads `aws-release/application.zip` plus `release.json` as a GitHub artifact.
    No Beanstalk mutation occurs in this mode, but ECR storage/build usage is real.
@@ -166,14 +209,14 @@ pass smoke tests. Provision listeners/redirects and confirm DNS before staging.
    tests; enable at least two instances across AZs only after measuring memory and
    database connection limits. Set a credit-aware maximum and scaling policies.
 
-## Subsequent staging, promotion and rollback
+## Subsequent staging Blue/Green releases and rollback
 
-1. Run **AWS stage backend** on main with `deploy_inactive=true` and `compatible=true`
+1. Run **AWS stage backend** on `fullcloudstaging` with `deploy_inactive=true` and `compatible=true`
    only after reviewing migrations, workers and backups. The script identifies the
    inactive environment from the actual production CNAME, deploys a unique version,
    checks Beanstalk health and verifies `/ready`, `/health` identity and product feed
    through that environment's HTTPS test hostname. It does not switch production.
-2. Run **AWS promote or rollback backend**, `mode=promote`, using the successful
+2. Run **AWS promote or rollback staging backend**, `mode=promote`, using the successful
    staging **run ID**. Confirm compatibility. Provenance and the exact active/candidate
    versions are checked again. The script records state before requesting a swap.
 3. Public smoke checks retry for DNS convergence. A confirmed swapped release that
@@ -181,7 +224,7 @@ pass smoke tests. Provision listeners/redirects and confirm DNS before staging.
    the workflow still fails and records `rolled_back`. An ambiguous state requires
    inspection instead of another blind swap. Inspect both DNS and actual traffic.
 4. For a later explicit rollback, select `mode=rollback` and the successful promotion
-   **run ID**, not the staging run ID. The `aws-promotion/promotion.json` record must
+   **run ID**, not the staging run ID. The `aws-promotion/promotion.json` artifact record must
    still match both environment versions. Stale/overwritten rollback targets fail.
 5. Keep both environments/images and data schema compatible until DNS, sockets and
    traffic drain. Never terminate the old environment immediately after a swap.
@@ -236,5 +279,5 @@ exception; this change neither adds exceptions nor resolves those findings.
 - [Platform hooks](https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/platforms-linux-extend.hooks.html)
 - [Secret-backed environment properties](https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/AWSHowTo.secrets.env-vars.html)
 - [Blue/Green DNS caveats](https://docs.aws.amazon.com/elasticbeanstalk/latest/dg/using-features.CNAMESwap.html)
-- [GitHub OIDC credentials action](https://github.com/aws-actions/configure-aws-credentials)
+- [AWS credentials action](https://github.com/aws-actions/configure-aws-credentials)
 - [AWS Project service availability](https://docs.aws.amazon.com/accounts/latest/reference/supported-services-sign-up-new.html)
