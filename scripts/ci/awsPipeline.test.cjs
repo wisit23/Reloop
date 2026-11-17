@@ -39,24 +39,88 @@ test("AWS workflows use Reloop branch names and keep automatic deployment main-o
   assert.match(promote, /run\.head_branch !== 'staging'/);
 });
 
-test("automatic deploy depends on the full CI workflow for the same main push", () => {
+test("AWS graph stays verify -> images -> bundle -> deploy with CI inside verify", () => {
   const release = fs.readFileSync(
     path.resolve(__dirname, "../../.github/workflows/aws-release.yml"), "utf8",
   );
   const ci = fs.readFileSync(
     path.resolve(__dirname, "../../.github/workflows/ci.yml"), "utf8",
   );
-  const ciJob = release.match(/^ {2}ci:\r?\n([\s\S]*?)(?=^ {2}\w[\w-]*:)/m)?.[1];
-  assert.ok(ciJob, "the release pipeline must run CI");
-  assert.match(ciJob, /if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/);
-  assert.match(ciJob, /uses: \.\/\.github\/workflows\/ci\.yml/);
-  assert.match(ci, /^ {2}workflow_call:/m);
+  const jobs = release.split(/\r?\njobs:\r?\n/)[1];
+  assert.deepEqual([...jobs.matchAll(/^ {2}([\w-]+):/gm)].map((match) => match[1]),
+    ["verify", "images", "bundle", "deploy"]);
+  const verify = jobs.split(/\r?\n {2}images:/)[0];
+  assert.match(verify, /actions: read/);
+  assert.match(verify, /Require successful CI for this main commit\r?\n {8}if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/);
+  assert.match(verify, /require\('\.\/scripts\/ci\/wait-for-ci\.cjs'\)/);
+  assert.doesNotMatch(release, /uses: \.\/\.github\/workflows\/ci\.yml/);
   const deployJob = release.match(/^ {2}deploy:\r?\n([\s\S]*)/m)?.[1];
-  assert.match(deployJob, /needs: \[ci, bundle\]/);
+  assert.match(deployJob, /needs: bundle/);
+  assert.match(release, /images:\r?\n {4}needs: verify/);
+  assert.match(release, /bundle:\r?\n {4}needs: images/);
   assert.doesNotMatch(deployJob, /always\(\)|continue-on-error:/);
   const stages = ci.match(/needs: \[([^\]]+)\]/)?.[1].split(/,\s*/).sort();
   assert.deepEqual(stages, ["core-tests", "docker-build", "frontend", "quality-gate", "service-tests"]);
   assert.match(ci, /jq -e 'all\(\.\[\]; \.result == "success"\)'/);
+});
+
+const waitForCi = require("./wait-for-ci.cjs");
+const ciRun = (overrides = {}) => ({
+  id: 1,
+  head_sha: "commit-main",
+  head_branch: "main",
+  event: "push",
+  path: ".github/workflows/ci.yml",
+  head_repository: { full_name: "wisit23/Reloop" },
+  status: "completed",
+  conclusion: "success",
+  ...overrides,
+});
+
+async function checkCi(responses, attempts = responses.length) {
+  let calls = 0;
+  let sleeps = 0;
+  await waitForCi({
+    github: { rest: { actions: { listWorkflowRuns: async (params) => {
+      assert.equal(params.workflow_id, "ci.yml");
+      assert.equal(params.head_sha, "commit-main");
+      assert.equal(params.branch, "main");
+      assert.equal(params.event, "push");
+      return { data: { workflow_runs: responses[calls++] || [] } };
+    } } } },
+    context: { repo: { owner: "wisit23", repo: "Reloop" }, sha: "commit-main", ref: "refs/heads/main" },
+    core: { info() {} },
+    attempts,
+    sleep: async () => { sleeps++; },
+  });
+  return { calls, sleeps };
+}
+
+test("CI gate waits for discovery and completion without running CI again", async () => {
+  assert.deepEqual(await checkCi([[], [ciRun({ status: "in_progress", conclusion: null })], [ciRun()]]),
+    { calls: 3, sleeps: 2 });
+  assert.deepEqual(await checkCi([[ciRun({ path: ".github/workflows/ci.yml@main" })]]),
+    { calls: 1, sleeps: 0 });
+});
+
+test("CI gate blocks failed, cancelled, skipped and timed-out CI", async () => {
+  for (const conclusion of ["failure", "cancelled", "skipped", "timed_out"]) {
+    await assert.rejects(checkCi([[ciRun({ conclusion })]]), /deployment blocked/);
+  }
+  await assert.rejects(checkCi([[], []]), /wait limit/);
+});
+
+test("CI gate rejects results from another commit, branch, event, workflow or repo", async () => {
+  for (const overrides of [
+    { head_sha: "old" }, { head_branch: "staging" }, { event: "pull_request" },
+    { path: ".github/workflows/other.yml" }, { head_repository: { full_name: "fork/Reloop" } },
+  ]) await assert.rejects(checkCi([[ciRun(overrides)]]), /wait limit/);
+});
+
+test("CI gate never falls back to an older successful run", async () => {
+  await assert.rejects(checkCi([[ciRun(), ciRun({ id: 2, conclusion: "failure" })]]), /deployment blocked/);
+  assert.deepEqual(await checkCi([[ciRun(), ciRun({ id: 2, status: "in_progress", conclusion: null })], [ciRun({ id: 2 })]]),
+    { calls: 2, sleeps: 1 });
 });
 
 test("Docker smoke check requires the Node major used by the project and images", () => {
