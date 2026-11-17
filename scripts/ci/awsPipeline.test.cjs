@@ -2,6 +2,56 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const openStagingPr = require("./staging-pr.cjs");
+
+async function promotionCase({ existing = [], ahead = 1, failCreate = false } = {}) {
+  const calls = [];
+  const summary = {
+    addRaw() { return this; },
+    addHeading() { return this; },
+    addLink(label, url) { calls.push(["link", url]); return this; },
+    async write() {},
+  };
+  await openStagingPr({
+    context: { repo: { owner: "wisit23", repo: "Reloop" }, runId: 123, sha: "tested-commit" },
+    core: { summary, info() {} },
+    github: { rest: {
+      pulls: {
+        async list(params) {
+          assert.deepEqual(params, { owner: "wisit23", repo: "Reloop", state: "open", base: "main", head: "wisit23:staging" });
+          return { data: existing };
+        },
+        async create(params) {
+          assert.equal(params.base, "main");
+          assert.equal(params.head, "staging");
+          assert.match(params.body, /actions\/runs\/123/);
+          assert.match(params.body, /tested-commit/);
+          if (failCreate) throw new Error("Pull request creation disabled");
+          calls.push(["create"]);
+          return { data: { number: 5, html_url: "https://github.com/wisit23/Reloop/pull/5" } };
+        },
+      },
+      repos: { async compareCommits() { calls.push(["compare"]); return { data: { ahead_by: ahead } }; } },
+    } },
+  });
+  return calls;
+}
+
+test("successful staging build creates a promotion PR and writes its link", async () => {
+  assert.deepEqual(await promotionCase(), [["compare"], ["create"], ["link", "https://github.com/wisit23/Reloop/pull/5"]]);
+});
+
+test("staging builds reuse an open promotion PR instead of duplicating it", async () => {
+  assert.deepEqual(await promotionCase({ existing: [{ number: 4, html_url: "existing-pr" }] }), [["link", "existing-pr"]]);
+});
+
+test("staging builds with no new commits do not open a PR", async () => {
+  assert.deepEqual(await promotionCase({ ahead: 0 }), [["compare"]]);
+});
+
+test("promotion PR permission errors are reported as a failed step", async () => {
+  await assert.rejects(promotionCase({ failCreate: true }), /creation disabled/);
+});
 
 // Execute the actual github-script provenance gate against the Actions API
 // boundary. An in-progress push run is trusted only by its own dependent job.
@@ -39,7 +89,7 @@ test("AWS workflows use Reloop branch names and keep automatic deployment main-o
   assert.match(promote, /run\.head_branch !== 'staging'/);
 });
 
-test("AWS graph stays verify -> images -> bundle -> deploy with CI inside verify", () => {
+test("AWS graph matches Ise without a repeated CI gate", () => {
   const release = fs.readFileSync(
     path.resolve(__dirname, "../../.github/workflows/aws-release.yml"), "utf8",
   );
@@ -50,77 +100,20 @@ test("AWS graph stays verify -> images -> bundle -> deploy with CI inside verify
   assert.deepEqual([...jobs.matchAll(/^ {2}([\w-]+):/gm)].map((match) => match[1]),
     ["verify", "images", "bundle", "deploy"]);
   const verify = jobs.split(/\r?\n {2}images:/)[0];
-  assert.match(verify, /actions: read/);
-  assert.match(verify, /Require successful CI for this main commit\r?\n {8}if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/main'/);
-  assert.match(verify, /require\('\.\/scripts\/ci\/wait-for-ci\.cjs'\)/);
+  assert.doesNotMatch(verify, /wait-for-ci|Require successful CI|uses: actions\/github-script/);
   assert.doesNotMatch(release, /uses: \.\/\.github\/workflows\/ci\.yml/);
   const deployJob = release.match(/^ {2}deploy:\r?\n([\s\S]*)/m)?.[1];
   assert.match(deployJob, /needs: bundle/);
   assert.match(release, /images:\r?\n {4}needs: verify/);
   assert.match(release, /bundle:\r?\n {4}needs: images/);
+  const bundle = jobs.split(/\r?\n {2}bundle:/)[1].split(/\r?\n {2}deploy:/)[0];
+  assert.match(bundle, /pull-requests: write/);
+  assert.match(bundle, /Open staging pull request to main\r?\n {8}if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/staging'/);
+  assert.match(bundle, /require\('\.\/scripts\/ci\/staging-pr\.cjs'\)/);
   assert.doesNotMatch(deployJob, /always\(\)|continue-on-error:/);
   const stages = ci.match(/needs: \[([^\]]+)\]/)?.[1].split(/,\s*/).sort();
   assert.deepEqual(stages, ["core-tests", "docker-build", "frontend", "quality-gate", "service-tests"]);
   assert.match(ci, /jq -e 'all\(\.\[\]; \.result == "success"\)'/);
-});
-
-const waitForCi = require("./wait-for-ci.cjs");
-const ciRun = (overrides = {}) => ({
-  id: 1,
-  head_sha: "commit-main",
-  head_branch: "main",
-  event: "push",
-  path: ".github/workflows/ci.yml",
-  head_repository: { full_name: "wisit23/Reloop" },
-  status: "completed",
-  conclusion: "success",
-  ...overrides,
-});
-
-async function checkCi(responses, attempts = responses.length) {
-  let calls = 0;
-  let sleeps = 0;
-  await waitForCi({
-    github: { rest: { actions: { listWorkflowRuns: async (params) => {
-      assert.equal(params.workflow_id, "ci.yml");
-      assert.equal(params.head_sha, "commit-main");
-      assert.equal(params.branch, "main");
-      assert.equal(params.event, "push");
-      return { data: { workflow_runs: responses[calls++] || [] } };
-    } } } },
-    context: { repo: { owner: "wisit23", repo: "Reloop" }, sha: "commit-main", ref: "refs/heads/main" },
-    core: { info() {} },
-    attempts,
-    sleep: async () => { sleeps++; },
-  });
-  return { calls, sleeps };
-}
-
-test("CI gate waits for discovery and completion without running CI again", async () => {
-  assert.deepEqual(await checkCi([[], [ciRun({ status: "in_progress", conclusion: null })], [ciRun()]]),
-    { calls: 3, sleeps: 2 });
-  assert.deepEqual(await checkCi([[ciRun({ path: ".github/workflows/ci.yml@main" })]]),
-    { calls: 1, sleeps: 0 });
-});
-
-test("CI gate blocks failed, cancelled, skipped and timed-out CI", async () => {
-  for (const conclusion of ["failure", "cancelled", "skipped", "timed_out"]) {
-    await assert.rejects(checkCi([[ciRun({ conclusion })]]), /deployment blocked/);
-  }
-  await assert.rejects(checkCi([[], []]), /wait limit/);
-});
-
-test("CI gate rejects results from another commit, branch, event, workflow or repo", async () => {
-  for (const overrides of [
-    { head_sha: "old" }, { head_branch: "staging" }, { event: "pull_request" },
-    { path: ".github/workflows/other.yml" }, { head_repository: { full_name: "fork/Reloop" } },
-  ]) await assert.rejects(checkCi([[ciRun(overrides)]]), /wait limit/);
-});
-
-test("CI gate never falls back to an older successful run", async () => {
-  await assert.rejects(checkCi([[ciRun(), ciRun({ id: 2, conclusion: "failure" })]]), /deployment blocked/);
-  assert.deepEqual(await checkCi([[ciRun(), ciRun({ id: 2, status: "in_progress", conclusion: null })], [ciRun({ id: 2 })]]),
-    { calls: 2, sleeps: 1 });
 });
 
 test("Docker smoke check requires the Node major used by the project and images", () => {
