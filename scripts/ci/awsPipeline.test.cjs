@@ -2,6 +2,56 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const openStagingPr = require("./staging-pr.cjs");
+
+async function promotionCase({ existing = [], ahead = 1, failCreate = false } = {}) {
+  const calls = [];
+  const summary = {
+    addRaw() { return this; },
+    addHeading() { return this; },
+    addLink(label, url) { calls.push(["link", url]); return this; },
+    async write() {},
+  };
+  await openStagingPr({
+    context: { repo: { owner: "wisit23", repo: "Reloop" }, runId: 123, sha: "tested-commit" },
+    core: { summary, info() {} },
+    github: { rest: {
+      pulls: {
+        async list(params) {
+          assert.deepEqual(params, { owner: "wisit23", repo: "Reloop", state: "open", base: "main", head: "wisit23:staging" });
+          return { data: existing };
+        },
+        async create(params) {
+          assert.equal(params.base, "main");
+          assert.equal(params.head, "staging");
+          assert.match(params.body, /actions\/runs\/123/);
+          assert.match(params.body, /tested-commit/);
+          if (failCreate) throw new Error("Pull request creation disabled");
+          calls.push(["create"]);
+          return { data: { number: 5, html_url: "https://github.com/wisit23/Reloop/pull/5" } };
+        },
+      },
+      repos: { async compareCommits() { calls.push(["compare"]); return { data: { ahead_by: ahead } }; } },
+    } },
+  });
+  return calls;
+}
+
+test("successful staging build creates a promotion PR and writes its link", async () => {
+  assert.deepEqual(await promotionCase(), [["compare"], ["create"], ["link", "https://github.com/wisit23/Reloop/pull/5"]]);
+});
+
+test("staging builds reuse an open promotion PR instead of duplicating it", async () => {
+  assert.deepEqual(await promotionCase({ existing: [{ number: 4, html_url: "existing-pr" }] }), [["link", "existing-pr"]]);
+});
+
+test("staging builds with no new commits do not open a PR", async () => {
+  assert.deepEqual(await promotionCase({ ahead: 0 }), [["compare"]]);
+});
+
+test("promotion PR permission errors are reported as a failed step", async () => {
+  await assert.rejects(promotionCase({ failCreate: true }), /creation disabled/);
+});
 
 // Execute the actual github-script provenance gate against the Actions API
 // boundary. An in-progress push run is trusted only by its own dependent job.
@@ -56,6 +106,10 @@ test("AWS graph matches Ise without a repeated CI gate", () => {
   assert.match(deployJob, /needs: bundle/);
   assert.match(release, /images:\r?\n {4}needs: verify/);
   assert.match(release, /bundle:\r?\n {4}needs: images/);
+  const bundle = jobs.split(/\r?\n {2}bundle:/)[1].split(/\r?\n {2}deploy:/)[0];
+  assert.match(bundle, /pull-requests: write/);
+  assert.match(bundle, /Open staging pull request to main\r?\n {8}if: github\.event_name == 'push' && github\.ref == 'refs\/heads\/staging'/);
+  assert.match(bundle, /require\('\.\/scripts\/ci\/staging-pr\.cjs'\)/);
   assert.doesNotMatch(deployJob, /always\(\)|continue-on-error:/);
   const stages = ci.match(/needs: \[([^\]]+)\]/)?.[1].split(/,\s*/).sort();
   assert.deepEqual(stages, ["core-tests", "docker-build", "frontend", "quality-gate", "service-tests"]);
